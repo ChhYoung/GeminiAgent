@@ -43,19 +43,119 @@ hello-agents/
 │           ├── terminal_tool.py  # ✨新增: 终端/文件系统（白名单限制）
 │           └── web_search_tool.py # ✨新增: Tavily 优先 + SerpAPI 备用
 │
-└── tests/                        # ✅ 测试套件（145 个用例，pytest + pytest-asyncio）
-    ├── conftest.py               # 共享 fixtures（tmp_db、mock_tool_call）
+└── tests/                        # ✅ 测试套件（159 个用例，pytest + pytest-asyncio）
     │
-    ├── unit/                     # 单元测试（117 个）——不依赖外部服务，纯本地
-    │   ├── test_memory_base.py   # MemoryRecord: 遗忘曲线 decay/reinforce/is_forgotten、序列化 roundtrip
-    │   ├── test_working_memory.py # WorkingMemory: add/get/TTL过期/pin保护/trim裁切/多session隔离
-    │   ├── test_tool_registry.py  # ToolRegistry: 注册/分发路由、未知工具错误、has_tool
-    │   ├── test_note_tool.py      # NoteToolHandler: SQLite CRUD（create/read/update/delete/list）、tag过滤
-    │   ├── test_terminal_tool.py  # TerminalToolHandler: 命令白名单/黑名单安全检查、文件读写、目录列举
-    │   ├── test_context_select.py # select(): min_score过滤、token预算贪心裁切、截断逻辑
-    │   └── test_context_structure.py # structure(): XML标签格式化（memory/knowledge/system_state分组）
+    ├── conftest.py               # 共享 fixtures
+    │                             #   • tmp_db      — 返回临时 SQLite 路径（每个测试隔离）
+    │                             #   • mock_tool_call — 构造 mock OpenAI tool_call 对象
     │
-    └── integration/              # 集成测试（28 个）——mock 外部 API，验证模块协作
-        ├── test_context_builder.py  # ContextBuilder GSSC流水线端到端、低分过滤、compress触发、异常健壮性
-        ├── test_web_search_tool.py  # WebSearchToolHandler: Tavily优先/SerpAPI备用/无key错误、参数传递
-        └── test_agent.py            # HelloAgent: start/stop生命周期、chat多轮、context注入、Function Calling分发、最大轮次保护
+    ├── run_tests.sh              # 🚀 一键全量执行脚本（见"测试执行策略"）
+    │
+    ├── unit/                     # 🧪 单元测试（117 个）
+    │   │                         #    策略：纯本地、无网络、无外部服务，毫秒级反馈
+    │   │                         #    工具：pytest，不依赖 mock 网络
+    │   │
+    │   ├── test_memory_base.py   # MemoryRecord（22 个）
+    │   │                         #   • 创建与默认值：strength/stability/access_count/UUID唯一性
+    │   │                         #   • decay()：Ebbinghaus 指数衰减公式验证、不低于0
+    │   │                         #   • reinforce()：access_count递增、strength/stability增强
+    │   │                         #   • is_forgotten()：新鲜记忆不遗忘、深度衰减超阈值
+    │   │                         #   • 序列化：to_storage_dict排除embedding、时间戳字符串化
+    │   │                         #   • roundtrip：from_storage_dict完整还原所有字段
+    │   │                         #   • MemoryQuery：默认类型列表、top_k默认值、自定义参数
+    │   │
+    │   ├── test_working_memory.py # WorkingMemory + WorkingMemoryStore（22 个）
+    │   │                         #   • add()：返回 MemoryRecord、importance映射score、metadata透传
+    │   │                         #   • get()：存在返回记录、不存在返回None、自动reinforce
+    │   │                         #   • TTL eviction：过期自动清除、pinned不受TTL影响
+    │   │                         #   • get_window()：返回最近N条、不足N时全返回
+    │   │                         #   • to_context_string()：[role]: content格式、空时返回""
+    │   │                         #   • delete()/clear()：删除存在/不存在记录、清空所有
+    │   │                         #   • pin()：保护记录不被trim、unpin()解除保护
+    │   │                         #   • WorkingMemoryStore：多session隔离、同session同实例
+    │   │
+    │   ├── test_tool_registry.py  # ToolRegistry（10 个）
+    │   │                         #   • register_handler()：单/多handler注册、schema正确存储
+    │   │                         #   • get_schemas()：返回副本防外部篡改、空注册表返回[]
+    │   │                         #   • dispatch()：按name路由到正确handler、返回handler结果
+    │   │                         #   • dispatch()：未知工具返回 {"error": ...} JSON
+    │   │                         #   • has_tool()：已注册返回True、未注册返回False
+    │   │
+    │   ├── test_note_tool.py      # NoteToolHandler SQLite CRUD（18 个）
+    │   │                         #   • create_note：基础/带tags/多条ID递增
+    │   │                         #   • read_note：读取存在记录/不存在返回error/含时间戳
+    │   │                         #   • update_note：更新title/content/tags各字段独立
+    │   │                         #   • delete_note：删除存在/不存在均返回deleted状态
+    │   │                         #   • list_notes：全量/空表/tag过滤/limit限制
+    │   │                         #   • 错误处理：非法JSON参数/未知tool名
+    │   │
+    │   ├── test_terminal_tool.py  # TerminalToolHandler（20 个）
+    │   │                         #   • _is_safe_command()：白名单通过（ls/cat/python3）
+    │   │                         #   • _is_safe_command()：黑名单拦截（rm/sudo/curl/>/空命令）
+    │   │                         #   • run_command()：echo执行/cwd参数/截断标志
+    │   │                         #   • run_command()：危险命令返回拦截error
+    │   │                         #   • read_file()：正常读取/不存在/目录/大文件截断/size字段
+    │   │                         #   • list_directory()：列举/不存在/隐藏文件控制/类型区分
+    │   │                         #   • 错误处理：非法JSON/未知tool名
+    │   │
+    │   ├── test_context_select.py # select()（9 个）
+    │   │                         #   • 过滤：min_score阈值剔除低相关度条目
+    │   │                         #   • 排序：score降序保证高优先级优先填充
+    │   │                         #   • token预算：精确填满/截断末尾item(>100chars)/剩余<100不截断
+    │   │                         #   • 边界：空输入/全不满足阈值/单条/metadata透传
+    │   │
+    │   └── test_context_structure.py # structure()（10 个）
+    │                             #   • 空输入返回""
+    │                             #   • memory组：<memory>标签/score展示/多条编号[1][2]
+    │                             #   • rag组：<knowledge>标签/source_file+section来源/unknown兜底
+    │                             #   • system_state组：<system_state>标签
+    │                             #   • 混合：三组同时存在/未知source忽略/组间\n\n分隔
+    │
+    └── integration/              # 🔗 集成测试（42 个）
+        │                         #    策略：mock外部API调用，验证模块间协作逻辑
+        │                         #    工具：pytest-asyncio（异步）+ unittest.mock
+        │
+        ├── test_context_builder.py  # ContextBuilder GSSC流水线（11 个）
+        │                         #   • 无数据源返回""、空记忆返回""
+        │                         #   • 有效记忆结果出现在输出中（含<memory>标签）
+        │                         #   • 低score条目被select阶段过滤
+        │                         #   • max_chars≤阈值不触发compress、超出触发LLM压缩
+        │                         #   • compress LLM失败降级为截断
+        │                         #   • memory gather异常不崩溃、token_budget自定义
+        │
+        ├── test_web_search_tool.py  # WebSearchToolHandler（7 个）
+        │                         #   • 无key返回配置错误提示
+        │                         #   • Tavily key存在时优先调用Tavily
+        │                         #   • Tavily失败自动降级SerpAPI
+        │                         #   • top_n参数正确透传
+        │                         #   • 非法JSON/未知tool名返回error
+        │
+        ├── test_agent.py            # HelloAgent（12 个）
+        │                         #   • start()/stop()调用memory start/stop
+        │                         #   • chat()返回assistant文本、空响应返回""
+        │                         #   • chat()写入工作记忆（user+assistant双条）
+        │                         #   • include_context=True调用ContextBuilder
+        │                         #   • include_context=False跳过ContextBuilder
+        │                         #   • ContextBuilder异常不影响chat返回
+        │                         #   • Function Calling：tool_call被dispatch、返回第二轮文本
+        │                         #   • 超过max_tool_rounds(5)自动停止循环
+        │                         #   • add_knowledge()：text/file分别调用正确接口
+        │
+        └── test_env_connectivity.py # 真实API连通性检测（14 个）⚠️ 需外部服务
+                                  #   • LLM：API Key配置检查 + 真实completion调用
+                                  #   • Embedding：text-embedding-v3向量生成 + 维度校验(1024)
+                                  #   • Qdrant：服务连通 + 写入/读取/清理临时集合
+                                  #   • Neo4j：服务连通 + Cypher读写/清理临时节点
+                                  #   • SQLite：目录可写 + 建表/读写/清理
+                                  #   • Tavily：Key配置 + 真实搜索返回结果
+                                  #   • SerpAPI：Key配置 + 真实搜索返回结果
+                                  #   • 汇总：打印所有服务配置状态摘要
+                                  #
+                                  # ─────────────────────────────────────────────
+                                  # 测试执行策略（run_tests.sh）
+                                  # ─────────────────────────────────────────────
+                                  # 模式          命令参数          适用场景
+                                  # unit          --unit            纯本地，CI/CD 快速反馈
+                                  # integration   --integration     mock测试，验证模块协作
+                                  # connectivity  --connectivity    真实API，上线前验证
+                                  # all (默认)    (无参数)          全量执行 + HTML报告

@@ -1,3 +1,6 @@
+# arch v1 — commit 1 (fccb355)
+> 初始架构：单 Agent + 记忆系统 + RAG + 基础工具
+
 hello-agents/
 └── hello_agents/
     ├── memory/                   # 🧠 核心记忆系统（Agent 的主观经验与内在认知）

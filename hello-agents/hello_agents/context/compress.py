@@ -34,6 +34,12 @@ from typing import Any
 import openai
 
 from hello_agents.config import get_settings
+from hello_agents.context.session_state import (
+    SessionState,
+    extract_session_state,
+    find_existing_state,
+    inject_state_into_messages,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -199,15 +205,17 @@ async def summarize_history(
     messages: list[dict],
     keep_recent: int = L3_KEEP_RECENT,
     max_total_chars: int = L3_SUMMARY_CHARS,
+    track_session_state: bool = False,
 ) -> list[dict]:
     """
     Layer 3：当 messages 总字符数超过 max_total_chars 时，
     将旧部分归纳为一条连续性摘要消息，保留最近 keep_recent 轮对话原文。
 
     Args:
-        messages:        完整 messages 列表（第 0 条通常是 system）
-        keep_recent:     保留最近几轮 user/assistant 对话原文
-        max_total_chars: 触发摘要的阈值
+        messages:           完整 messages 列表（第 0 条通常是 system）
+        keep_recent:        保留最近几轮 user/assistant 对话原文
+        max_total_chars:    触发摘要的阈值
+        track_session_state: 为 True 时额外提取结构化会话状态并注入 [会话状态] 消息
 
     Returns:
         压缩后的 messages 列表（system 消息始终保留在头部）
@@ -236,17 +244,36 @@ async def summarize_history(
         f"[{m.get('role', '?')}]: {str(m.get('content', ''))[:500]}"
         for m in to_summarize
     )
-    summary = await _llm_summarize_text(history_text)
+
+    # 并发：摘要 + 会话状态提取（如果开启）
+    existing_state = find_existing_state(messages) if track_session_state else None
+
+    if track_session_state:
+        summary, session_state = await asyncio.gather(
+            _llm_summarize_text(history_text),
+            extract_session_state(to_summarize, existing_state=existing_state),
+        )
+    else:
+        summary = await _llm_summarize_text(history_text)
+        session_state = None
+
     summary_msg = {
         "role": "system",
         "content": f"[历史对话摘要]\n{summary}",
     }
 
     compressed = system_msgs + [summary_msg] + tail
+
+    # 注入会话状态（固定在 system 消息后，比摘要优先级更高）
+    if session_state and not session_state.is_empty():
+        compressed = inject_state_into_messages(compressed, session_state)
+        logger.debug("Layer3: session state injected (goal=%r)", session_state.current_goal)
+
     logger.info(
-        "Layer3: %d msgs → 1 summary + %d tail (total chars: %d → %d)",
+        "Layer3: %d msgs → 1 summary + %d tail (total chars: %d → %d)%s",
         len(to_summarize), len(tail),
         _total_chars(messages), _total_chars(compressed),
+        " + session_state" if session_state else "",
     )
     return compressed
 
@@ -256,21 +283,31 @@ async def apply_all_layers(
     keep_tool_recent: int = L2_KEEP_RECENT,
     history_threshold: int = L3_SUMMARY_CHARS,
     keep_dialog_recent: int = L3_KEEP_RECENT,
+    track_session_state: bool = False,
 ) -> list[dict]:
     """
     依序应用三层压缩到 messages 列表。
 
     推荐在每轮 LLM 调用前调用此函数。
+
+    Args:
+        messages:           OpenAI messages 列表
+        keep_tool_recent:   Layer 2：保留最近几条 tool_result 原文
+        history_threshold:  Layer 3：触发连续性摘要的总字符阈值
+        keep_dialog_recent: Layer 3：摘要后保留最近几轮对话原文
+        track_session_state: 为 True 时在 Layer 3 额外提取并注入结构化会话状态
+                             （包含：当前目标、已完成操作、修改文件、待完成、关键决策）
     """
     # Layer 1: 大结果落盘
     msgs = spill_large_results(messages)
     # Layer 2: 旧结果折叠
     msgs = fold_old_results(msgs, keep_recent=keep_tool_recent)
-    # Layer 3: 整体摘要
+    # Layer 3: 整体摘要（可选：附带会话状态提取）
     msgs = await summarize_history(
         msgs,
         keep_recent=keep_dialog_recent,
         max_total_chars=history_threshold,
+        track_session_state=track_session_state,
     )
     return msgs
 

@@ -10,7 +10,7 @@ import math
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -63,11 +63,11 @@ class MemoryRecord(BaseModel):
     importance_score: float = Field(default=0.5, ge=0.0, le=1.0)
 
     # 向量表示（序列化时存为 list）
-    embedding: list[float] | None = None
+    embedding: Optional[List[float]] = None
 
     # 来源溯源
-    source_session_id: str | None = None
-    source_agent_id: str | None = None
+    source_session_id: Optional[str] = None
+    source_agent_id: Optional[str] = None
 
     @field_validator("strength", mode="before")
     @classmethod
@@ -133,7 +133,7 @@ class MemoryQuery(BaseModel):
     top_k: int = Field(default=5, ge=1, le=50)
     min_strength: float = Field(default=0.1, ge=0.0, le=1.0, description="强度过滤阈值")
     min_relevance: float = Field(default=0.0, ge=0.0, le=1.0, description="相关度过滤阈值")
-    session_id: str | None = None
+    session_id: Optional[str] = None
 
 
 class MemorySearchResult(BaseModel):

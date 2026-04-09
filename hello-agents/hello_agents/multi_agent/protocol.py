@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
-MessageType = Literal["request", "response", "event"]
+MessageType = Literal["request", "response", "event", "broadcast", "vote", "vote_reply", "delegate"]
 
 
 @dataclass

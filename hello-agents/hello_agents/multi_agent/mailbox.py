@@ -122,6 +122,17 @@ class Mailbox:
 
     # ---- DB helpers ----
 
+    def read_all(self, agent_id: str) -> "list[AgentMessage]":
+        """读取 agent 所有未消费消息（全部标记为 consumed）。"""
+        from hello_agents.multi_agent.protocol import AgentMessage
+        msgs = []
+        while True:
+            d = self._db_fetch(agent_id)
+            if d is None:
+                break
+            msgs.append(AgentMessage.from_dict(d))
+        return msgs
+
     def _db_insert(self, to_agent: str, msg_json: str) -> None:
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(

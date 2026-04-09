@@ -77,3 +77,55 @@ class TestAgentMessage:
             payload={"event": "task_done"},
         )
         assert msg.msg_type == "event"
+
+    # v5 新增消息类型测试
+
+    def test_broadcast_type(self):
+        msg = AgentMessage(
+            from_agent="lead",
+            to_agent="all",
+            msg_type="broadcast",
+            payload={"content": "start now"},
+        )
+        assert msg.msg_type == "broadcast"
+
+    def test_vote_type(self):
+        msg = AgentMessage(
+            from_agent="lead",
+            to_agent="member-1",
+            msg_type="vote",
+            payload={"question": "continue?", "options": ["yes", "no"]},
+        )
+        assert msg.msg_type == "vote"
+        assert "options" in msg.payload
+
+    def test_vote_reply_type(self):
+        msg = AgentMessage(
+            from_agent="member-1",
+            to_agent="lead",
+            msg_type="vote_reply",
+            payload={"vote": "yes"},
+        )
+        assert msg.msg_type == "vote_reply"
+
+    def test_delegate_type(self):
+        msg = AgentMessage(
+            from_agent="lead",
+            to_agent="coder",
+            msg_type="delegate",
+            payload={"task_desc": "implement feature X", "expected_format": "code"},
+        )
+        assert msg.msg_type == "delegate"
+        assert msg.payload["task_desc"] == "implement feature X"
+
+    def test_new_types_roundtrip(self):
+        for mtype in ("broadcast", "vote", "vote_reply", "delegate"):
+            msg = AgentMessage(
+                from_agent="a",
+                to_agent="b",
+                msg_type=mtype,
+                payload={"data": mtype},
+            )
+            d = msg.to_dict()
+            msg2 = AgentMessage.from_dict(d)
+            assert msg2.msg_type == mtype

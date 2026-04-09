@@ -41,6 +41,7 @@ from hello_agents.tools.builtin.task_tool import TASK_TOOLS, TaskToolHandler
 from hello_agents.tools.builtin.background_tool import BACKGROUND_TOOLS, BackgroundToolHandler
 from hello_agents.tools.builtin.agent_tool import AGENT_TOOLS, AgentToolHandler
 from hello_agents.tools.registry import ToolRegistry
+from hello_agents.context.compress import apply_all_layers
 from hello_agents.tasks.scheduler import Scheduler
 from hello_agents.tasks.store import TaskStore
 from hello_agents.tasks.background import BackgroundExecutor
@@ -242,6 +243,8 @@ class HelloAgent:
         current_messages = list(messages)
 
         for _ in range(self._max_tool_rounds):
+            # 三层压缩：大结果落盘 → 旧结果折叠 → 超长历史摘要
+            current_messages = await apply_all_layers(current_messages)
             response = await self._call_llm(current_messages, tool_schemas)
             message = response.choices[0].message
 

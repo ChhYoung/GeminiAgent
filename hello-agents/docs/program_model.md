@@ -52,9 +52,74 @@
 
 ---
 
-## 2. 父子 Agent 程序模型
+## 2. Agent 对象组合图（持有关系）
 
-### 2.1 SubAgentRunner：隔离上下文的执行单元
+每个 Agent 对象持有哪些子对象，以及边界在哪：
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ HelloAgent                                                        │
+│   _client: OpenAI                                                 │
+│   _registry: ToolRegistry ──► { "read_file": ReadFileTool,       │
+│                                 "bash": BashTool, ... }           │
+│   _max_tool_rounds: int                                           │
+│                                                                   │
+│   ◆─── 按需创建 ───►  SubAgentRunner                              │
+│                           _client: (共享引用)                      │
+│                           _registry: (共享引用)                    │
+│                           messages[]: list   ← 每次 run() 新建     │
+└──────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────┐
+│ TaskPipeline                                                      │
+│   _client: OpenAI                                                 │
+│   _model: str                                                     │
+│   _analyzer: TaskAnalyzer                                         │
+│   _roster: TeamRoster ──► SQLite/JSON 持久化存储                   │
+│   _role_max_tokens: int                                           │
+│                                                                   │
+│   ◆─── 每角色创建 ──► _RoleRunner                                  │
+│                           _spec: RoleSpec                         │
+│                           _client: (共享引用)                      │
+│                           messages[]: list   ← 每次 run() 新建     │
+└──────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────┐
+│ WorkerAgent                                                       │
+│   agent_id: str                                                   │
+│   _kanban: Kanban ──────────────────────────────┐                │
+│   _runner: SubAgentRunner                        │  共享对象       │
+│   _poll_interval: float                          │  多个 Worker   │
+│   _running: bool                                 │  指向同一实例   │
+│                                              ◄───┘                │
+└──────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────┐
+│ Mailbox                                                           │
+│   _db_path: str                                                   │
+│   _conn: sqlite3.Connection  ← 持久化连接，懒初始化                │
+│   _lock: threading.Lock      ← 保护 _conn                        │
+│   _inbox_events: dict[str, threading.Event]                       │
+│       "agent_a" ──► Event()                                       │
+│       "agent_b" ──► Event()   ← 惰性创建，每 agent 一个           │
+└──────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────┐
+│ Kanban                                                            │
+│   _tasks: dict[str, Task]                                         │
+│       "t1" ──► Task(status=IN_PROGRESS, assignee="w1")           │
+│       "t2" ──► Task(status=PENDING)                               │
+│       "t3" ──► Task(status=DONE, result="...")                    │
+│   _last_seen: dict[str, datetime]  ← 心跳时间                     │
+│   _lock: threading.Lock                                           │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. 父子 Agent 程序模型
+
+### 3.1 SubAgentRunner：隔离上下文的执行单元
 
 ```python
 class SubAgentRunner:
@@ -74,7 +139,7 @@ class SubAgentRunner:
 
 **设计模式 — Chain of Responsibility**：LLM 决定是否调用工具，`ToolRegistry.dispatch()` 根据工具名路由到对应 handler，结果追加进 messages，下一轮 LLM 继续决策，直到不再产生工具调用。
 
-### 2.2 父子关系数据流
+### 3.2 父子关系数据流
 
 ```
 父 Agent                         子 Agent (SubAgentRunner)
@@ -93,7 +158,7 @@ call runner.run("子任务")  ──────►  messages = [system, user]
 
 ---
 
-## 3. AgentMessage 协议
+## 4. AgentMessage 协议
 
 ```python
 @dataclass
@@ -137,7 +202,7 @@ Agent-A 收到 response:
 
 ---
 
-## 4. Mailbox：持久化消息队列
+## 5. Mailbox：持久化消息队列
 
 ### 4.1 核心接口
 
@@ -193,7 +258,7 @@ def _db_fetch(agent_id) -> dict | None:
 
 ---
 
-## 5. 多 Agent 系统：WorkerAgent + Kanban
+## 6. 多 Agent 系统：WorkerAgent + Kanban
 
 ### 5.1 WorkerAgent 状态机
 
@@ -251,7 +316,7 @@ def claim(agent_id) -> Task | None:
 
 ---
 
-## 6. TeamCoordinator：团队交互
+## 7. TeamCoordinator：团队交互
 
 ### 6.1 接口
 
@@ -294,7 +359,7 @@ lead: read_all(from_agent) → 统计票数
 
 ---
 
-## 7. TaskPipeline：动态角色编排
+## 8. TaskPipeline：动态角色编排
 
 ### 7.1 类关系
 
@@ -334,7 +399,7 @@ TaskPipeline
 
 ---
 
-## 8. AgentRegistry：进程单例注册表
+## 9. AgentRegistry：进程单例注册表
 
 ```python
 class AgentRegistry:
@@ -356,7 +421,7 @@ def get_registry() -> AgentRegistry:
 
 ---
 
-## 9. TaskGraph：DAG 依赖管理
+## 10. TaskGraph：DAG 依赖管理
 
 ```python
 class TaskGraph:
@@ -392,7 +457,240 @@ task-C 就绪条件: A.status==DONE AND B.status==DONE
 
 ---
 
-## 10. 设计模式汇总
+## 11. 对象交互序列图
+
+### 10.1 SubAgentRunner 工具调用链（对象视角）
+
+```
+  :HelloAgent         :SubAgentRunner       :ToolRegistry      :ReadFileTool
+       │                     │                    │                   │
+       │ runner.run(task)    │                    │                   │
+       │────────────────────►│                    │                   │
+       │                     │ new messages[]     │                   │
+       │                     │                    │                   │
+       │                     │──to_thread(create)─────────► openai   │
+       │                     │◄── message(tool_call: read_file) ──── │
+       │                     │                    │                   │
+       │                     │ dispatch(tc) ──────►│                   │
+       │                     │                    │ handler=get("read_file")
+       │                     │                    │──────────────────►│
+       │                     │                    │◄── "文件内容..." ──│
+       │                     │◄── "文件内容..." ───│                   │
+       │                     │                    │                   │
+       │                     │ messages.append(tool_result)          │
+       │                     │──to_thread(create)─────────► openai   │
+       │                     │◄── message(content="最终答案")         │
+       │                     │                    │                   │
+       │◄── "最终答案" ────── │                    │                   │
+       │                     │ [messages[] GC]    │                   │
+```
+
+### 10.2 Mailbox 对象内部状态（收发双方）
+
+```
+                    ┌─── Mailbox 对象内部 ───────────────────────────┐
+                    │                                                │
+  Agent-A           │  _conn ──► SQLite WAL                         │  Agent-B
+     │              │  _lock: Lock                                  │     │
+     │ send_sync    │  _inbox_events:                               │     │
+     │ ("B", msg) ──┼──► acquire _lock                             │     │
+     │              │    INSERT INTO messages                       │     │
+     │              │    commit()                                   │     │
+     │              │    release _lock                             │     │
+     │              │    events["B"].set() ─────────────────────────┼────►│ 唤醒
+     │              │                                                │     │
+     │              │                         recv("B", timeout=5) ─┼─────│
+     │              │                         acquire _lock          │     │
+     │              │                         BEGIN IMMEDIATE        │     │
+     │              │                         SELECT consumed=0      │     │
+     │              │                         UPDATE consumed=1      │     │
+     │              │                         COMMIT                 │     │
+     │              │                         release _lock          │     │
+     │              │◄── AgentMessage ──────────────────────────────┼─────│
+                    └────────────────────────────────────────────────┘
+```
+
+### 10.3 WorkerAgent + Kanban 对象协作
+
+```
+  :WorkerAgent(w1)    :WorkerAgent(w2)        :Kanban              :Task(t1)
+       │                    │                    │                      │
+       │ run_forever()      │ run_forever()      │                      │
+       │ claim("w1") ──────►│                    │                      │
+       │                    │ claim("w2") ───────►│                      │
+       │                    │                    │ acquire _lock        │
+       │                    │                    │ find PENDING ────────►│
+       │                    │                    │ t1.status=IN_PROGRESS│
+       │                    │                    │ t1.assignee="w1"    │
+       │                    │                    │ release _lock        │
+       │◄── task(t1) ───────│                    │                      │
+       │                    │◄── None ───────────│                      │
+       │                    │ await sleep ───┐   │                      │
+       │ await runner.run() │               │   │                      │
+       │ (协程挂起等 LLM)    │               │   │                      │
+       │                    │◄──────────────┘   │                      │
+       │                    │ claim("w2") ───────►│ (新 task 入队则认领) │
+       │◄── result ─────────│                    │                      │
+       │ complete(t1.id) ───►                    │                      │
+       │                    │                    │ t1.status=DONE ──────►│
+```
+
+### 10.4 TeamCoordinator 三种通信模式（对象序列）
+
+```
+广播 (broadcast)
+─────────────────
+  :coordinator    :mailbox        :member_1       :member_2
+       │              │               │               │
+       │ for member   │               │               │
+       │ send_sync ──►│               │               │
+       │              │ INSERT(to=m1) │               │
+       │ send_sync ──►│               │               │
+       │              │ INSERT(to=m2) │               │
+       │              │               │recv_sync("m1")│
+       │              │◄──────────────│               │
+       │              │               │               │ recv_sync("m2")
+       │              │◄──────────────────────────────│
+
+委托+应答 (delegate → response)
+──────────────────────────────
+  :coordinator    :mailbox        :worker
+       │              │               │
+       │ delegate() ─►│               │
+       │              │ INSERT(delegate,msg_id="D1") │
+       │              │               │
+       │              │               │ recv_sync("worker")
+       │              │◄──────────────│
+       │              │               │ make_response(correlation_id="D1")
+       │              │               │ send_sync("lead", resp) ──►│
+       │              │ INSERT(response,correlation_id="D1")      │
+       │ recv_sync ──►│               │
+       │              │◄─ response ───│
+       │ msg.correlation_id=="D1" ✓   │
+
+投票 (vote → vote_reply)
+────────────────────────
+  :coordinator    :mailbox      :member_1    :member_2
+       │              │              │            │
+       │ vote() ──────►             │            │
+       │              │ INSERT(vote,to=m1)        │
+       │              │ INSERT(vote,to=m2)        │
+       │ sleep(1s)    │              │            │
+       │              │ recv → vote  │            │ recv → vote
+       │              │ send_sync(vote_reply,"yes")│
+       │              │ send_sync(vote_reply,"no") │────►
+       │ read_all     │              │            │
+       │ (lead inbox) │              │            │
+       │◄─ [reply×2] ─│              │            │
+       │ 统计票数      │              │            │
+```
+
+### 10.5 TaskGraph 依赖门控（对象状态视角）
+
+```
+初始状态：
+  Task-A [PENDING, deps=[]]
+  Task-B [PENDING, deps=[]]
+  Task-C [PENDING, deps=[A,B]]
+  Task-D [PENDING, deps=[C]]
+
+  ready_tasks() → [A, B]      (A、B 无依赖)
+
+  ┌─────┐     ┌─────┐
+  │  A  │────►│     │
+  │PEND │     │  C  │────►┌─────┐
+  └─────┘  ┌─►│PEND │     │  D  │
+  ┌─────┐  │  └─────┘     │PEND │
+  │  B  │──┘              └─────┘
+  │PEND │
+  └─────┘
+
+A 完成后：
+  ready_tasks() → [B]         (C 还差 B)
+
+  ┌─────┐     ┌─────┐
+  │  A  │────►│     │
+  │DONE │     │  C  │────►┌─────┐
+  └─────┘  ┌─►│PEND │     │  D  │
+  ┌─────┐  │  └─────┘     │PEND │
+  │  B  │──┘              └─────┘
+  │PEND │
+  └─────┘
+
+A、B 均完成后：
+  ready_tasks() → [C]         (D 还差 C)
+
+  ┌─────┐     ┌─────┐
+  │  A  │────►│     │
+  │DONE │     │  C  │────►┌─────┐
+  └─────┘  ┌─►│PEND │     │  D  │
+  ┌─────┐  │  └─────┘     │PEND │
+  │  B  │──┘              └─────┘
+  │DONE │
+
+C 完成后：
+  ready_tasks() → [D]         (全链路解锁)
+```
+
+---
+
+## 12. AgentMessage 全生命周期
+
+```
+创建
+  AgentMessage(
+    from_agent="lead",
+    to_agent="worker_1",
+    msg_type="delegate",
+    payload={"task_desc": "分析日志"}
+  )
+  → msg_id="a3f9"  (uuid4 自动生成)
+  → created_at=now
+
+         │
+         ▼ to_dict()
+
+序列化
+  {
+    "msg_id": "a3f9",
+    "msg_type": "delegate",
+    "from_agent": "lead",
+    "to_agent": "worker_1",
+    "correlation_id": null,
+    "payload": {"task_desc": "分析日志"},
+    "created_at": "2026-05-08T10:00:00"
+  }
+
+         │
+         ▼ Mailbox.send_sync() → INSERT INTO messages(msg_json)
+
+持久化
+  SQLite row: id=42, to_agent="worker_1", consumed=0
+
+         │
+         ▼ Mailbox.recv_sync("worker_1") → _db_fetch() → from_dict()
+
+反序列化
+  AgentMessage(msg_id="a3f9", msg_type="delegate", ...)
+  consumed=1  (已从 DB 取出)
+
+         │
+         ▼ worker_1 处理后调用 make_response()
+
+应答
+  AgentMessage(
+    from_agent="worker_1",
+    to_agent="lead",
+    msg_type="response",
+    correlation_id="a3f9",   ← 关联原始请求
+    payload={"result": "分析完成"}
+  )
+  → msg_id="b7c2"  (新 ID)
+```
+
+---
+
+## 13. 设计模式汇总
 
 | 模式 | 位置 | 说明 |
 |------|------|------|
@@ -407,7 +705,7 @@ task-C 就绪条件: A.status==DONE AND B.status==DONE
 
 ---
 
-## 11. 关键接口边界
+## 14. 关键接口边界
 
 ```
 外部调用者

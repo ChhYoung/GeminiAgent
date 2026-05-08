@@ -265,7 +265,174 @@ ThreadPoolExecutor (线程池)
 
 ---
 
-## 8. 设计原则总结
+## 8. Agent 对象生命周期
+
+每种 Agent 对象的创建时机、存活范围与销毁时机：
+
+```
+进程启动
+    │
+    ├─► HelloAgent          ── 进程级单例，随程序存活
+    │       │
+    │       ├─► SubAgentRunner  ── 按需创建，run() 返回即可 GC
+    │       │       │
+    │       │       └─► messages[]  ── 随 SubAgentRunner 存活，run() 后释放
+    │       │
+    │       └─► ToolRegistry    ── 注入给 HelloAgent，随 HelloAgent 存活
+    │
+    ├─► TaskPipeline         ── 调用方持有，可复用
+    │       │
+    │       ├─► TaskAnalyzer    ── 注入或随 Pipeline 创建，可复用
+    │       │
+    │       └─► _RoleRunner     ── 每个角色创建一次，run() 后丢弃
+    │               │
+    │               └─► messages[]  ── 每次 run() 新建，返回即释放
+    │
+    ├─► WorkerAgent × N      ── asyncio.Task 包装，stop() 后退出
+    │       │
+    │       └─► SubAgentRunner  ── 注入，随 WorkerAgent 存活
+    │
+    ├─► Kanban               ── 注入给所有 WorkerAgent，进程级共享
+    │       └─► _tasks{}        ── Task 对象随任务生命周期存活
+    │
+    ├─► Mailbox              ── 进程级共享（可多个 Agent 引用同一实例）
+    │       ├─► _conn           ── 懒初始化后持久化，进程结束才关闭
+    │       └─► _inbox_events{} ── 每个 agent_id 一个 Event，惰性创建
+    │
+    └─► AgentRegistry        ── 模块级单例，进程存活期间有效
+            └─► _agents{}       ── PeerAgent 注册后驻留，unregister() 才移除
+```
+
+关键规律：
+- **短命对象**：`SubAgentRunner.messages[]`、`_RoleRunner` — 一用即弃，天然隔离
+- **中命对象**：`SubAgentRunner`、`WorkerAgent` — 任务粒度存活
+- **长命对象**：`Mailbox`、`Kanban`、`AgentRegistry` — 进程级，跨多个任务共享
+
+---
+
+## 9. 时序图：父 Agent 调用子 Agent
+
+```
+时间轴 ──────────────────────────────────────────────────────────►
+
+ :HelloAgent          :SubAgentRunner      :ToolRegistry    openai API
+      │                      │                   │              │
+      │  runner.run(task) ──►│                   │              │
+      │                      │ messages=[sys,usr] │              │
+      │                      │──── to_thread ─────────────────►│
+      │                      │                   │   HTTP POST  │
+      │                      │                   │◄─ response ──│
+      │                      │                   │  (tool_call) │
+      │                      │ dispatch(tc) ─────►│              │
+      │                      │◄── tool_result ───│              │
+      │                      │                   │              │
+      │                      │──── to_thread ─────────────────►│
+      │                      │                   │   HTTP POST  │
+      │                      │                   │◄─ response ──│
+      │                      │                   │  (text)      │
+      │◄── return text ───── │                   │              │
+      │                      │ [messages[] 释放]  │              │
+```
+
+父 Agent 在 `await runner.run()` 期间**暂停**，Event Loop 可调度其他协程。
+子 Agent 完成后，`messages[]` 随栈帧释放，父 Agent 只见到返回的字符串。
+
+---
+
+## 10. 时序图：WorkerAgent 认领并执行任务
+
+```
+时间轴 ──────────────────────────────────────────────────────────►
+
+ :WorkerAgent-1    :WorkerAgent-2       :Kanban          :SubAgentRunner
+      │                  │                  │                   │
+      │  claim("w1") ───►│                  │                   │
+      │                  │   claim("w2") ──►│                   │
+      │                  │                  │  _lock acquired   │
+      │                  │                  │  task→IN_PROGRESS │
+      │                  │                  │  return task ────►│ (w1 得到)
+      │                  │                  │  _lock released   │
+      │                  │◄── claim("w2") ──│                   │
+      │                  │  (下一 PENDING)   │                   │
+      │                  │                  │                   │
+      │  await run(goal) ──────────────────────────────────────►│
+      │  (协程挂起)        │                  │                   │
+      │                  │  await run(goal2)──────────────────► │ (w2 同时执行)
+      │                  │                  │                   │
+      │◄─── result ──────────────────────────────────────────── │
+      │  complete(id) ──►│                  │                   │
+      │                  │                  │  task→DONE        │
+      │  await sleep ────►                  │                   │
+      │  (让出 Event Loop)│                  │                   │
+```
+
+两个 Worker 的 `claim()` 串行化在 `_lock` 内，但 `run()` 期间并发执行（各自 await 等待 LLM 响应）。
+
+---
+
+## 11. 时序图：Mailbox 消息投递与唤醒
+
+```
+时间轴 ──────────────────────────────────────────────────────────►
+
+ :Agent-A             :Mailbox              :Agent-B (await recv)
+      │                    │                       │
+      │                    │  recv("B",timeout=5)──►│
+      │                    │  _db_fetch("B")        │  → None
+      │                    │  event.clear()         │
+      │                    │  _db_fetch("B")        │  → None (double-check)
+      │                    │  to_thread(event.wait) │
+      │                    │                       │ [线程挂起，Event Loop 空闲]
+      │                    │                       │
+      │ send_sync("B",msg)─►│                       │
+      │                    │ INSERT INTO messages   │
+      │                    │ _conn.commit()         │
+      │                    │ event["B"].set() ─────►│ [线程唤醒]
+      │                    │                       │
+      │                    │  _db_fetch("B") ───────│ → {msg}
+      │                    │◄──────────────────────►│
+      │                    │                       │ return AgentMessage
+```
+
+`event.set()` 在 `send_sync` 返回前调用，`Agent-B` 的等待线程被立即唤醒，无需等待下一个 poll 周期。
+
+---
+
+## 12. 时序图：TaskPipeline 完整流水线
+
+```
+时间轴 ──────────────────────────────────────────────────────────►
+
+ :调用方    :TaskPipeline   :TaskAnalyzer  :_RoleRunner×3   :TeamRoster
+    │             │               │               │               │
+    │ solve(task)─►│               │               │               │
+    │             │ analyze(task)─►│               │               │
+    │             │               │  LLM 调用      │               │
+    │             │◄── specs[] ───│               │               │
+    │             │                               │               │
+    │             │ create_team ───────────────────────────────── ►│
+    │             │◄──────────────────────────────────────────── team│
+    │             │                               │               │
+    │             │   [role=analyst]              │               │
+    │             │── run(task, prior=[]) ────────►│               │
+    │             │◄── content_1 ─────────────────│               │
+    │             │                               │               │
+    │             │   [role=writer]               │               │
+    │             │── run(task, prior=[(analyst,content_1)]) ─────►│
+    │             │◄── content_2 ─────────────────────────────────│
+    │             │                               │               │
+    │             │   [role=reviewer]             │               │
+    │             │── run(task, prior=[(analyst,c1),(writer,c2)]) ►│
+    │             │◄── content_3 ─────────────────────────────────│
+    │             │                               │               │
+    │◄─ TaskResult│                               │               │
+```
+
+每个 `_RoleRunner` 串行调用，`prior_outputs` 随角色推进**累积**，最后一个角色能看到所有前置角色的产出。
+
+---
+
+## 13. 设计原则总结
 
 | 原则 | 体现 |
 |------|------|

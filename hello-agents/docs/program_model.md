@@ -4,6 +4,170 @@
 
 ---
 
+## 0. 整体对象关系全景图
+
+```
+图例：  ◆── 组合（拥有/生命周期绑定）   ──► 关联（持有引用）
+        ·──► 创建（按需实例化，用后 GC）   ══► 经 Mailbox 发消息
+```
+
+```
+╔══════════════════════════════════════════════════════════════════════════════════════╗
+║                            入口 / 主控层                                              ║
+║                                                                                      ║
+║  ┌────────────────────────────────┐      ┌───────────────────────────────────────┐  ║
+║  │         HelloAgent             │      │           TaskPipeline                │  ║
+║  │  ◆ _client: OpenAI            │      │  ◆ _client: OpenAI                    │  ║
+║  │  ◆ _registry: ToolRegistry    │      │  ◆ _analyzer: TaskAnalyzer            │  ║
+║  │                                │      │  ◆ _roster: TeamRoster               │  ║
+║  │  ·──► SubAgentRunner           │      │  ◆ _role_max_tokens: int              │  ║
+║  └───────────────┬────────────────┘      │                                       │  ║
+║                  │                        │  ·──► _RoleRunner × N                │  ║
+║                  │                        │  ·──► TaskResult                     │  ║
+║                  │                        └──────────────┬────────────────────────┘  ║
+╚══════════════════│══════════════════════════════════════│════════════════════════════╝
+                   │ ·──►                                  │ ·──► N                    
+                   ▼                                       ▼                           
+╔══════════════════════════════════════════════════════════════════════════════════════╗
+║                              执行层                                                   ║
+║                                                                                      ║
+║  ┌───────────────────────────────┐     ┌───────────────────────────────────────┐   ║
+║  │       SubAgentRunner          │     │           _RoleRunner                 │   ║
+║  │  ──► _client: OpenAI SDK      │     │  ──► _client: OpenAI SDK              │   ║
+║  │  ──► _registry: ToolRegistry  │     │  ──► _spec: RoleSpec                  │   ║
+║  │  ◆  messages[]: list          │     │  ◆  messages[]: list                  │   ║
+║  │        └─ 每次 run() 新建      │     │        └─ 每次 run() 新建，运行后释放   │   ║
+║  └───────────────┬───────────────┘     └───────────────────────────────────────┘   ║
+║                  │ ──►                           │ ──►                              ║
+║                  ▼                               ▼                                  ║
+║  ┌───────────────────────────────┐     ┌───────────────────────────────────────┐   ║
+║  │       ToolRegistry            │     │           RoleSpec                    │   ║
+║  │  handlers: {name → callable}  │     │  role / display_name / system_prompt  │   ║
+║  │  dispatch(tool_call) -> str   │     │  capabilities / reason                │   ║
+║  └───────────────────────────────┘     └───────────────────────────────────────┘   ║
+╚══════════════════════════════════════════════════════════════════════════════════════╝
+                   │ ──►                           │ ──►                              
+                   ▼                               ▼                                  
+╔══════════════════════════════════════════════════════════════════════════════════════╗
+║                          团队/多 Agent 协调层                                         ║
+║                                                                                      ║
+║  ┌──────────────────────────────────────────────────────────────────────────────┐   ║
+║  │  WorkerAgent × N                                                             │   ║
+║  │    ──► _kanban: Kanban   ──► _runner: SubAgentRunner   ◆ _running: bool      │   ║
+║  │    run_forever() [asyncio.Task]  →  claim() → run() → complete()/fail()      │   ║
+║  └──────────────────────────────────────────────────────────────────────────────┘   ║
+║                                                                                      ║
+║  ┌──────────────────────────┐       ┌────────────────────────────────────────────┐  ║
+║  │    TeamCoordinator       │       │           AgentRegistry  (进程单例)         │  ║
+║  │  ──► _mailbox: Mailbox   │       │  ◆ _agents: {agent_id → PeerAgent}         │  ║
+║  │  broadcast() / vote()    │       │  register() / get() / unregister()         │  ║
+║  │  delegate()              │       └──────────────┬─────────────────────────────┘  ║
+║  └──────────────┬───────────┘                      │ ──►                            ║
+║                 │ ══►                               ▼                               ║
+║                 ▼                        ┌──────────────────────────────────────┐   ║
+║  ┌──────────────────────────────────┐   │           PeerAgent                  │   ║
+║  │          Mailbox  (共享)          │   │  agent_id / name / speciality         │   ║
+║  │  ◆ _conn: sqlite3.Connection     │   │  system_prompt / tool_names           │   ║
+║  │  ◆ _lock: threading.Lock         │   └──────────────────────────────────────┘   ║
+║  │  ◆ _inbox_events:{id→Event}      │                                               ║
+║  │  send/recv  send_sync/recv_sync  │                                               ║
+║  │  batch_send / read_all           │                                               ║
+║  └──────────────────────────────────┘                                               ║
+╚══════════════════════════════════════════════════════════════════════════════════════╝
+                   │ stores/reads                                                      
+                   ▼                                                                   
+╔══════════════════════════════════════════════════════════════════════════════════════╗
+║                          任务管理 / 基础设施层                                         ║
+║                                                                                      ║
+║  ┌───────────────────────────────┐   ┌────────────────────────────────────────┐    ║
+║  │         Kanban  (共享)         │   │         TaskGraph                      │    ║
+║  │  ◆ _tasks: {id → Task}        │   │  ◆ _tasks: {id → Task}                 │    ║
+║  │  ◆ _lock: threading.Lock      │   │  ready_tasks() / topological_order()   │    ║
+║  │  claim() [原子, TOCTOU 安全]   │   │  has_cycle()  [Kahn 算法]              │    ║
+║  │  complete() / fail()          │   └──────────────────────────────────────── ┘   ║
+║  │  release_stale() [僵死恢复]   │                                                   ║
+║  └────────────────┬──────────────┘   ┌────────────────────────────────────────┐    ║
+║                   │ contains          │      BackgroundExecutor                │    ║
+║                   ▼                   │  ◆ _pool: ThreadPoolExecutor           │    ║
+║  ┌───────────────────────────────┐   │  ◆ _futures: {job_id → Future}         │    ║
+║  │           Task                │   │  ◆ _callbacks: {job_id → [fn]}         │    ║
+║  │  id / goal / steps            │   │  submit() / poll() / on_complete()     │    ║
+║  │  status: PENDING              │   └────────────────────────────────────────┘    ║
+║  │        → IN_PROGRESS          │                                                   ║
+║  │        → DONE / FAILED        │                                                   ║
+║  │  assignee / deps / result     │                                                   ║
+║  └───────────────────────────────┘                                                   ║
+╚══════════════════════════════════════════════════════════════════════════════════════╝
+                   │ carried by Mailbox                                                
+                   ▼                                                                   
+╔══════════════════════════════════════════════════════════════════════════════════════╗
+║                              消息协议 / 数据层                                        ║
+║                                                                                      ║
+║  ┌──────────────────────────────────────────────────────────────────────────────┐   ║
+║  │                          AgentMessage                                        │   ║
+║  │                                                                              │   ║
+║  │  msg_id: str          msg_type: request│response│event│broadcast│vote│delegate│  ║
+║  │  from_agent: str      to_agent: str                                          │   ║
+║  │  correlation_id: str  (response 指向对应 request 的 msg_id)                   │   ║
+║  │  payload: dict        created_at: datetime                                   │   ║
+║  │                                                                              │   ║
+║  │  make_response(from_agent, payload) → AgentMessage(correlation_id=self.id)  │   ║
+║  └──────────────────────────────────────────────────────────────────────────────┘   ║
+║                                                                                      ║
+║  ┌───────────────────────────────┐   ┌──────────────────────────────────────────┐  ║
+║  │  TaskResult                   │   │  TeamRoster → AgentTeam → TeamMember[]   │  ║
+║  │  ◆ outputs:{role→RoleOutput}  │   │  team_id / name / members / shared_rules │  ║
+║  │  .code / .test_cases /        │   │  agent_id / role / capabilities          │  ║
+║  │  .design_doc / .review ...    │   └──────────────────────────────────────────┘  ║
+║  │  to_markdown() / save_report()│                                                  ║
+║  └───────────────────────────────┘                                                  ║
+╚══════════════════════════════════════════════════════════════════════════════════════╝
+```
+
+---
+
+### 对象间主要关系一览
+
+```
+┌─────────────────────┬────────────────────┬───────────────────────────────────────┐
+│ 发起方               │ 关系               │ 目标方                                 │
+├─────────────────────┼────────────────────┼───────────────────────────────────────┤
+│ HelloAgent          │ ·──► 创建           │ SubAgentRunner（每次任务）              │
+│ HelloAgent          │ ──► 注入            │ ToolRegistry                          │
+│ TaskPipeline        │ ·──► 创建           │ _RoleRunner × N（每角色）               │
+│ TaskPipeline        │ ──► 持有            │ TaskAnalyzer、TeamRoster               │
+│ SubAgentRunner      │ ──► 调用            │ ToolRegistry.dispatch()               │
+│ _RoleRunner         │ ──► 读取            │ RoleSpec（system_prompt / role）       │
+│ WorkerAgent         │ ──► 共享引用         │ Kanban（多 Worker 引用同一实例）        │
+│ WorkerAgent         │ ·──► 轮询认领        │ Kanban.claim()                        │
+│ TeamCoordinator     │ ══► 发消息          │ Mailbox → 各 Agent 收件箱              │
+│ AgentRegistry       │ ◆── 注册持有         │ PeerAgent                             │
+│ Kanban              │ ◆── 存储            │ Task（PENDING/IN_PROGRESS/DONE）       │
+│ TaskGraph           │ ──► 门控            │ Task（依赖全 DONE 才就绪）              │
+│ Mailbox             │ ◆── 持有连接         │ sqlite3.Connection（WAL 持久化）        │
+│ Mailbox             │ ◆── 每 Agent 一个   │ threading.Event（消息到达通知）         │
+│ BackgroundExecutor  │ ◆── 线程池          │ ThreadPoolExecutor                    │
+└─────────────────────┴────────────────────┴───────────────────────────────────────┘
+```
+
+---
+
+### Mailbox 通信矩阵（msg_type）
+
+```
+发送方 ──► 接收方        msg_type       payload 关键字段
+─────────────────────────────────────────────────────────────────
+lead        → member     broadcast      content, team_id
+lead        → member     vote           question, options, team_id
+member      → lead       vote_reply     vote
+lead        → worker     delegate       task_desc, expected_format
+worker      → lead       response       result  + correlation_id
+任意         → 任意       request        自定义
+任意         → 任意       event          自定义（无需应答）
+```
+
+---
+
 ## 1. 类层次总览
 
 ```
